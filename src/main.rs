@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
@@ -23,9 +24,15 @@ fn main() {
     let path2 = PathBuf::from(args.next().unwrap());
     
     if command == "unpack" {
-        unpack_table(path1, path2).unwrap();
+        if let Err(e) = unpack_table(path1, path2) {
+            eprintln!("Error while unpacking: {}", e);
+            std::process::exit(1);
+        }
     } else if command == "pack" {
-        todo!();
+        if let Err(e) = pack_table(path1, path2) {
+            eprintln!("Error while packing: {}", e);
+            std::process::exit(1);
+        }
     } else {
         eprintln!("error: Unknown command {:?}", command);
         std::process::exit(1);
@@ -73,6 +80,74 @@ fn unpack_table(table_path: PathBuf, mut out_directory: PathBuf) -> Result<(), s
             out_directory.pop();
         }
     }
+    
+    Ok(())
+}
+
+fn pack_table(input_directory: PathBuf, table_path: PathBuf) -> Result<(), Box<dyn Error>> {
+    // Read all files in the folder, or error out if we can't
+    let mut entries = fs::read_dir(&input_directory)?.collect::<Vec<_>>();
+    for entry in &entries {
+        if entry.is_err() {
+            eprintln!("IO error occurred while reading {}", input_directory.to_string_lossy());
+            panic!();
+        }
+    }
+    
+    let mut files_and_numbers =
+        // First extract the path from the DirEntry
+        entries.iter().map(|e| (e.as_ref().unwrap().path(), e.as_ref().unwrap().path()))
+        // Then try to turn the filename without the extension into a u16
+        .map(|(p1, p2)| (p1.file_stem().and_then(|q|
+            q.to_str().and_then(|r|
+                u16::from_str(r).ok()
+            )
+        ), p2))
+        // Only keep the files for which that succeeded
+        .filter(|(o1, _)| o1.is_some())
+        .map(|(o, p)| (o.unwrap(), p))
+        // And put the result in a Vec
+        .collect::<Vec<(u16, PathBuf)>>();
+
+    // There should be files with numerical names in this folder, otherwise something probably went wrong
+    assert!(files_and_numbers.len() != 0);
+
+    // Sort it in numerical order and verify that there are no duplicates or missing files
+    files_and_numbers.sort_unstable_by(|(num1, _), (num2, _)| num1.cmp(num2));
+    for (i, tup) in files_and_numbers.iter().enumerate() {
+        if usize::from(tup.0) != i {
+            return Err(format!("While looking for file number {}, found file '{}'. Do you have two files named '{}' (without the extension)? Is the file named '{}' missing?",
+                i, tup.1.to_string_lossy(), i - 1, i).into());
+            // ...Hey wait this isn't how you return an error
+            // panic!();
+        }
+    }
+    
+    // Now for the actual interesting part!
+    let mut table_bytes = vec![0u8; files_and_numbers.len() * 4 + 8];
+    table_bytes.splice(0..4, (files_and_numbers.len() as u32).to_le_bytes());
+    // Using the number in the tuple is safe, because we verified in the previous loop that
+    // it's equal to what you'd get from a normal .iter().enumerate() call
+    for (i, filename) in &files_and_numbers {
+        let offset_bytes = if filename.extension().unwrap_or_default().to_str().unwrap() == "ignore" {
+            0u32.to_le_bytes()
+        } else {
+            let mut file_bytes = fs::read(filename)?;
+            let file_offset: u32 = match table_bytes.len().try_into() {
+                Ok(n) => n,
+                Err(err) => return Err(err.into())
+            };
+            table_bytes.append(&mut file_bytes);
+            file_offset.to_le_bytes()
+        };
+        table_bytes.splice((usize::from(*i) * 4 + 4)..(usize::from(*i) * 4 + 8), offset_bytes);
+    }
+    let length: u32 = match table_bytes.len().try_into() {
+        Ok(n) => n,
+        Err(err) => return Err(err.into())
+    };
+    table_bytes.splice((files_and_numbers.len() * 4 + 4)..(files_and_numbers.len() * 4 + 8), length.to_le_bytes());
+    fs::write(table_path, table_bytes)?;
     
     Ok(())
 }
